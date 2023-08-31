@@ -1,2 +1,159 @@
-Apache Kafka is an open-source distributed event streaming platform used by thousands of companies for high-performance data pipelines, streaming.
-An Apache Kafka Producer is a client application that publishes (writes) events to a Kafka cluster.
+
+public class ElasticsearchClient extends AbstractElasticsearchClient {
+    private static final Logger log = LoggerFactory.getLogger(OceElasticsearchClient.class);
+    private ObjectMapper objectMapper;
+
+    public OceElasticsearchClient(ObjectMapper mapper, ElasticsearchConfig elasticsearchConfig, MeterRegistry meterRegistry) throws MalformedURLException {
+        super(elasticsearchConfig, meterRegistry);
+        this.objectMapper = mapper;
+    }
+
+    public UpdateResponse createOrUpdateDocument(String docId, Serializable source, String indexName) {
+        UpdateResponse response = null;
+
+        try {
+            IndexRequest indexRequest = (new IndexRequest(indexName)).source(this.objectMapper.writeValueAsString(source), XContentType.JSON);
+            UpdateRequest updateRequest;
+            if (this.getElasticsearchConfig().isBulkInsertEnabled()) {
+                updateRequest = (new UpdateRequest(indexName, docId)).doc(indexRequest).upsert(indexRequest).retryOnConflict(this.getElasticsearchConfig().getRetryOnConflict());
+                this.getElasticsearchConfig().getBulkInsertTimeout().ifPresent((s) -> {
+                    updateRequest.timeout(TimeValue.timeValueSeconds(s));
+                });
+                this.getBulkProcessor().add(updateRequest);
+            } else {
+                updateRequest = (new UpdateRequest(indexName, docId)).retryOnConflict(this.getElasticsearchConfig().getRetryOnConflict()).doc(indexRequest).setRefreshPolicy(RefreshPolicy.IMMEDIATE).upsert(indexRequest);
+                response = this.getRestHighLevelClient().update(updateRequest, RequestOptions.DEFAULT);
+            }
+        } catch (JsonProcessingException var7) {
+            log.error("ERROR Json processing insert es", var7);
+        } catch (IOException var8) {
+            log.error(var8.getMessage() + " updating document with id " + docId, var8);
+        }
+
+        return response;
+    }
+
+    public DeleteResponse delete(String docId, String indexName) {
+        DeleteResponse response = null;
+        DeleteRequest deleteRequest = new DeleteRequest(indexName);
+        deleteRequest.id(docId);
+
+        try {
+            if (this.getElasticsearchConfig().isBulkInsertEnabled()) {
+                this.getElasticsearchConfig().getBulkInsertTimeout().ifPresent((s) -> {
+                    deleteRequest.timeout(TimeValue.timeValueSeconds(s));
+                });
+                this.getBulkProcessor().add(deleteRequest);
+            } else {
+                response = this.getRestHighLevelClient().delete(deleteRequest, RequestOptions.DEFAULT);
+            }
+        } catch (IOException var6) {
+            log.error(var6.getMessage() + " deleting for the id: " + docId, var6);
+        }
+
+        return response;
+    }
+
+    public BulkByScrollResponse deleteWithQuery(QueryBuilder query, String indexName) {
+        BulkByScrollResponse response = null;
+        DeleteByQueryRequest request = new DeleteByQueryRequest(new String[]{indexName});
+        request.setQuery(query);
+
+        try {
+            response = this.getRestHighLevelClient().deleteByQuery(request, RequestOptions.DEFAULT);
+        } catch (IOException var6) {
+            log.error(var6.getMessage() + " deleting for the date older than: " + query.toString(), var6);
+        }
+
+        return response;
+    }
+
+    public CreateIndexResponse createIndex(String indexName, String aliasName, Boolean setAlias, @Nullable InputStream mappingStream, @Nullable InputStream custom_analyzers) throws IOException {
+        try {
+            GetIndexRequest request = new GetIndexRequest(new String[]{indexName});
+            if (this.getRestHighLevelClient().indices().exists(request, RequestOptions.DEFAULT)) {
+                CreateIndexResponse fakeResponse = new CreateIndexResponse(true, true, indexName);
+                log.warn(String.format("Index %s already created", indexName));
+                return fakeResponse;
+            }
+        } catch (IOException var13) {
+            log.error(String.format("Can not create index %s", indexName), var13);
+            throw new RuntimeException("Error verifying the index existence");
+        }
+
+        CreateIndexRequest indexRequest = new CreateIndexRequest(indexName);
+        JsonObjectBuilder wholeSource = Json.createObjectBuilder().add("settings", this.buildIndexSettings(custom_analyzers));
+        if (setAlias) {
+            wholeSource.add("aliases", Json.createObjectBuilder().add(aliasName, Json.createObjectBuilder()));
+        }
+
+        if (mappingStream != null) {
+            JsonReader reader = Json.createReader(mappingStream);
+
+            try {
+                wholeSource.add("mappings", reader.readObject());
+            } catch (Throwable var12) {
+                if (reader != null) {
+                    try {
+                        reader.close();
+                    } catch (Throwable var11) {
+                        var12.addSuppressed(var11);
+                    }
+                }
+
+                throw var12;
+            }
+
+            if (reader != null) {
+                reader.close();
+            }
+        }
+
+        String source = wholeSource.build().toString();
+        indexRequest.source(source, XContentType.JSON);
+        CreateIndexResponse createIndexResponse = this.getRestHighLevelClient().indices().create(indexRequest, RequestOptions.DEFAULT);
+        if (!createIndexResponse.isAcknowledged()) {
+            log.error("Elasticsearch create index request not acknowledged");
+            throw new IllegalStateException("Elasticsearch create index request not acknowledged");
+        } else {
+            log.info("Index created {}", indexName);
+            return createIndexResponse;
+        }
+    }
+
+    private JsonObjectBuilder buildIndexSettings(@Nullable InputStream custom_analyzers) {
+        JsonObjectBuilder settings = Json.createObjectBuilder().add("number_of_shards", this.getElasticsearchConfig().getShards()).add("number_of_replicas", this.getElasticsearchConfig().getReplicas());
+        if (custom_analyzers != null) {
+            JsonReader reader = Json.createReader(custom_analyzers);
+
+            try {
+                settings.add("analysis", reader.readObject());
+            } catch (Throwable var7) {
+                if (reader != null) {
+                    try {
+                        reader.close();
+                    } catch (Throwable var6) {
+                        var7.addSuppressed(var6);
+                    }
+                }
+
+                throw var7;
+            }
+
+            if (reader != null) {
+                reader.close();
+            }
+        }
+
+        this.getElasticsearchConfig().getTranslogDurability().ifPresent((s) -> {
+            settings.add("translog.durability", s);
+        });
+        this.getElasticsearchConfig().getTranslogSyncInterval().ifPresent((s) -> {
+            settings.add("translog.sync_interval", s);
+        });
+        this.getElasticsearchConfig().getRefreshInterval().ifPresent((s) -> {
+            settings.add("refresh_interval", s);
+        });
+        return settings;
+    }
+}
